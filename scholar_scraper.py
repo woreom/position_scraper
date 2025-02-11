@@ -9,35 +9,48 @@ from bs4 import BeautifulSoup
 import pandas as pd
 from tqdm import tqdm
 import unicodedata
+import json  # Add if not already imported
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from utils import get_unique_filename, create_folder
+from firecrawl_helper import crawl_personal_page  # Update import statement location
 
-def clean_scholar_csv(df:pd.DataFrame) -> pd.DataFrame:
-    
+def clean_scholar_csv(df: pd.DataFrame) -> pd.DataFrame:
     print(f"Original rows: {len(df)}")
-    # Create a copy of the DataFrame
     new_df = df.copy()
+    
     # Remove duplicates based on profile_id
     df = df.drop_duplicates(subset='profile_id')
     
-    # Clean names - remove ORCID info and normalize characters
-    new_df['name'] = df['name'].apply(lambda x: unicodedata.normalize('NFKD', x).encode('ASCII', 'ignore').decode('ASCII').split('[')[0].strip())
-    
-    # Clean positions - normalize characters
-    new_df['position'] = df['position'].apply(lambda x: unicodedata.normalize('NFKD', x).encode('ASCII', 'ignore').decode('ASCII') if isinstance(x, str) else x)
-    
-    # Clean interests - normalize characters
-    new_df['interests'] = df['interests'].apply(lambda x: unicodedata.normalize('NFKD', x).encode('ASCII', 'ignore').decode('ASCII') if isinstance(x, str) else x)
+    # Clean text fields with consistent normalization
+    text_columns = ['name', 'position', 'institute', 'department', 'advisor', 'interests']
+    for col in text_columns:
+        if col in new_df.columns:
+            new_df[col] = df[col].apply(
+                lambda x: unicodedata.normalize('NFKD', x).encode('ASCII', 'ignore').decode('ASCII') if isinstance(x, str) else x
+            )
     
     # Sort by name
     new_df = new_df.sort_values('name')
     
-    # Reorder columns and capitalize names
-    column_order = ['name', 'position', 'interests', 'email', 'website', 'profile_id', 'orcid', 'profile_url']
+    # Define final column order with citation metrics
+    column_order = [
+        'name', 'position', 'institute', 'department',
+        'advisor', 'interests', 'email', 'website',
+        'profile_id', 'orcid', 'profile_url', 'source_url',
+        'funding_likelihood', 'citations', 'h_index', 'i10_index'
+    ]
+    
+    # Ensure all required columns exist, fill with empty strings if missing
+    for col in column_order:
+        if col not in new_df.columns:
+            new_df[col] = ''
+    
+    # Select and order columns
     new_df = new_df[column_order]
     new_df.columns = new_df.columns.str.upper()
     
-    print(f"Cleaned rows: {len(df)}")
+    print(f"Cleaned rows: {len(new_df)}")
     return new_df
 
 def normalize_obfuscated_email(text: str) -> Optional[str]:
@@ -120,6 +133,9 @@ class GoogleScholarScraper:
         }
         self.researchers = []
         self.logger = logging.getLogger(__name__)
+        self.firecrawl_api = None  # Will be initialized when needed
+        if not os.getenv('FIRECRAWL_API_KEY') or not os.getenv('OPENAI_API_KEY'):
+            self.logger.warning("Missing required API keys")
 
     def _parse_researchers(self, html: str) -> tuple[List[Dict], str]:
         """Parse researchers and get next page token"""
@@ -209,25 +225,60 @@ class GoogleScholarScraper:
                     label = interest['href'].split('mauthors=label:')[1]
                     interests.append(label)
                     
+            # Extract citation metrics
+            citations = h_index = i10_index = ''
+            metrics_table = soup.find('table', id='gsc_rsb_st')
+            if metrics_table:
+                rows = metrics_table.find_all('tr')
+                for row in rows[1:]:  # Skip header row
+                    cells = row.find_all('td')
+                    if len(cells) >= 2:
+                        metric_name = cells[0].text.strip().lower()
+                        metric_value = cells[1].text.strip()  # All citations value
+                        if 'citations' in metric_name:
+                            citations = metric_value
+                        elif 'h-index' in metric_name:
+                            h_index = metric_value
+                        elif 'i10-index' in metric_name:
+                            i10_index = metric_value
+            
             researcher.update({
                 'email': email,
                 'website': website,
                 'orcid': orcid,
                 'position': position,
-                'interests': ','.join(interests)
+                'interests': ','.join(interests) if interests else '',
+                'institute': '',  # Will be updated by Firecrawl
+                'department': '',  # Will be updated by Firecrawl
+                'advisor': '',     # Will be updated by Firecrawl
+                'funding_likelihood': '',
+                'citations': citations,
+                'h_index': h_index,
+                'i10_index': i10_index
             })
 
-            # If no email found and website exists, try website
+            # Use enhanced Firecrawl + OpenAI extraction first
+            if researcher.get('website'):
+                firecrawl_data = crawl_personal_page(researcher['website'], self.headers)
+                if firecrawl_data:
+                    # Prioritize Firecrawl/OpenAI extracted email if found
+                    if firecrawl_data.get('email'):
+                        researcher['email'] = firecrawl_data['email']
+                        self.logger.info(f"Found email via Firecrawl/OpenAI for {researcher['name']}")
+                    researcher.update(firecrawl_data)
+                    self.logger.info(f"Retrieved enhanced data for {researcher['name']}")
+            
+            # Fallback to traditional email extraction if still no email
             if not researcher.get('email') and researcher.get('website'):
                 website_email = extract_email_from_webpage(
                     researcher['website'], 
                     self.headers
                 )
-            if website_email:
-                researcher['email'] = website_email
-                self.logger.info(f"Found email from website for {researcher['name']}")
+                if website_email:
+                    researcher['email'] = website_email
+                    self.logger.info(f"Found email via fallback method for {researcher['name']}")
             
-            time.sleep(3)  # Rate limiting
+            time.sleep(3)
             return researcher
         
         except Exception as e:
@@ -237,6 +288,8 @@ class GoogleScholarScraper:
     def search_researchers_by_label(self, label: str, pages: int = 5):
         try:
             after_author = ''
+            processed_count = 0
+            
             for page in tqdm(range(pages), desc="Crawling pages"):
                 try:
                     self.logger.info(f"Processing page {page + 1}/{pages}")
@@ -261,10 +314,17 @@ class GoogleScholarScraper:
                     
                     self.logger.info(f"Found {len(researchers)} researchers on page {page + 1}")
                     
-                    for researcher in researchers:
-                        self.logger.info(f"Researcher found: {researcher['name']}")
-                        researcher = self.get_profile_details(researcher)
-                        self.researchers.append(researcher)
+                    # Process researcher profiles concurrently
+                    with ThreadPoolExecutor(max_workers=5) as executor:
+                        future_to_profile = {
+                            executor.submit(self.get_profile_details, researcher): researcher
+                            for researcher in researchers
+                        }
+                        for future in as_completed(future_to_profile):
+                            profile = future.result()
+                            self.researchers.append(profile)
+                            processed_count += 1
+                            self.logger.info(f"Processed {processed_count} profiles")
                     
                     if not after_author:
                         self.logger.info("No more pages available")
@@ -300,6 +360,7 @@ def main(label: str = "meta_learning", pages: int = 5):
     scraper.save_results(label)
 
 if __name__ == "__main__":
-    labels = "machine_learning"
-    pages = 1
+    
+    labels = "large_language_model"
+    pages = 500
     main(label=labels, pages=pages)
